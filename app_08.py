@@ -6,16 +6,15 @@ import wave
 import speech_recognition as sr
 from googletrans import Translator
 from PyQt5.QtWidgets import QApplication, QWidget, QPushButton, QVBoxLayout, QTextEdit, QComboBox
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import QThread, pyqtSignal, QTimer
+import queue
 
 class AudioRecorderThread(QThread):
-    update = pyqtSignal(str, str)
-    finished = pyqtSignal()
-
-    def __init__(self, speaker):
+    def __init__(self, speaker, message_queue):
         super().__init__()
         self.speaker = speaker
         self.is_recording = False
+        self.message_queue = message_queue
 
     def run(self):
         SAMPLE_RATE = 44100
@@ -32,12 +31,12 @@ class AudioRecorderThread(QThread):
         # Procesar todo el audio al finalizar
         if all_data:
             self.process_audio(np.concatenate(all_data), SAMPLE_RATE)
-        
-        self.finished.emit()
 
     def process_audio(self, data, SAMPLE_RATE):
-        # Convertir los datos de audio a bytes
+        # Agregar un mensaje a la cola
+        self.message_queue.put("Procesando audio...")
 
+        # Convertir los datos de audio a bytes
         byte_data = (data * 32767).astype(np.int16).tobytes()
 
         # Crear un buffer en memoria para los datos de audio
@@ -55,22 +54,26 @@ class AudioRecorderThread(QThread):
 
         # Usar el buffer directamente para el reconocimiento de voz
         r = sr.Recognizer()
-        with sr.AudioFile(audio_buffer) as source:
-            self.update.emit("Reconociendo voz...", "")
-            audio_data = r.record(source)
 
-            try:
-                # Reconocimiento de voz en portugués brasileño
-                # texto = r.recognize_google(audio_data, language='pt-BR')
-                texto = r.recognize_google(audio_data, language='es-ES')
+        try:
+            with sr.AudioFile(audio_buffer) as source:
+                self.message_queue.put("Reconociendo voz...")
+
+                audio_data = r.record(source)
+                self.message_queue.put("audio_data...")
+                texto = r.recognize_google(audio_data, language='pt-BR')
+                self.message_queue.put("texto...")
+
                 if texto.strip():
                     translator = Translator()
-                    # translated_text = translator.translate(texto, src='pt', dest='es')  # Traducir de portugués a español
-                    translated_text = translator.translate(texto, src='es', dest='es')  # Traducir de portugués a español
-                    self.update.emit(texto, translated_text.text)
-            except Exception as e:
-                self.update.emit(str(e), "")
+                    self.message_queue.put("Traduciendo texto...")
+                    translated_text = translator.translate(texto, src='pt', dest='es')
 
+                    self.message_queue.put(f"Texto original: {texto}")
+                    self.message_queue.put(f"Texto traducido: {translated_text.text}")
+
+        except Exception as e:
+            self.message_queue.put(f"Error: {str(e)}")
 
     def stop(self):
         self.is_recording = False
@@ -80,6 +83,12 @@ class AudioTranslatorApp(QWidget):
         super().__init__()
         self.initUI()
         self.is_recording = False
+        self.message_queue = queue.Queue()  # Crear la cola de mensajes
+
+        # Usar un temporizador para verificar la cola
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.check_messages)
+        self.timer.start(100)  # Verificar la cola cada 100 ms
 
     def initUI(self):
         layout = QVBoxLayout()
@@ -146,9 +155,7 @@ class AudioTranslatorApp(QWidget):
         self.resultText.append("Grabando...")
 
         selected_speaker = self.speakers[self.deviceCombo.currentIndex()]
-        self.thread = AudioRecorderThread(selected_speaker)
-        self.thread.update.connect(self.onUpdate)
-        self.thread.finished.connect(self.onRecordingFinished)
+        self.thread = AudioRecorderThread(selected_speaker, self.message_queue)
         self.thread.start()
 
     def stopRecording(self):
@@ -157,12 +164,11 @@ class AudioTranslatorApp(QWidget):
         self.recordButton.setEnabled(False)
         self.resultText.append("Finalizando grabación...")
 
-    def onUpdate(self, original, translated):
-        self.resultText.append("------------------------")
-        self.resultText.append(f"Texto original: {original}")
-        self.resultText.append("--------")
-        self.resultText.append(f"Texto traducido: {translated}")
-        self.resultText.append("------------------------")
+    def check_messages(self):
+        # Verificar si hay mensajes en la cola y mostrarlos en la interfaz
+        while not self.message_queue.empty():
+            message = self.message_queue.get()
+            self.resultText.append(message)
 
     def onRecordingFinished(self):
         self.is_recording = False

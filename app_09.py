@@ -1,25 +1,23 @@
 import sys
 import soundcard as sc
 import numpy as np
-import io
-import wave
-import speech_recognition as sr
+import whisper
 from googletrans import Translator
 from PyQt5.QtWidgets import QApplication, QWidget, QPushButton, QVBoxLayout, QTextEdit, QComboBox
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import QThread, pyqtSignal, QTimer
+import queue
 
 class AudioRecorderThread(QThread):
-    update = pyqtSignal(str, str)
-    finished = pyqtSignal()
-
-    def __init__(self, speaker):
+    def __init__(self, speaker, message_queue):
         super().__init__()
         self.speaker = speaker
         self.is_recording = False
+        self.message_queue = message_queue
+        self.whisper_model = whisper.load_model("base").cpu()
 
     def run(self):
-        SAMPLE_RATE = 44100
-        CHUNK_DURATION = 2  # Duración de cada fragmento en segundos
+        SAMPLE_RATE = 16000  # Whisper prefers 16kHz
+        CHUNK_DURATION = 2  # Duration of each chunk in seconds
 
         self.is_recording = True
         all_data = []
@@ -29,57 +27,49 @@ class AudioRecorderThread(QThread):
                 data = mic.record(numframes=SAMPLE_RATE * CHUNK_DURATION)
                 all_data.append(data)
 
-        # Procesar todo el audio al finalizar
+        # Process all audio when finished
         if all_data:
-            self.process_audio(np.concatenate(all_data), SAMPLE_RATE)
-        
-        self.finished.emit()
+            self.process_audio(np.concatenate(all_data))
 
-    def process_audio(self, data, SAMPLE_RATE):
-        # Convertir los datos de audio a bytes
+    def process_audio(self, data):
+        self.message_queue.put("Procesando audio...")
 
-        byte_data = (data * 32767).astype(np.int16).tobytes()
+        try:
+            self.message_queue.put("Reconociendo voz con Whisper...")
+            
+            # Ensure data is in the correct format for Whisper
+            audio_data = data.flatten().astype(np.float32)
+            
+            # Use Whisper for speech recognition
+            result = self.whisper_model.transcribe(audio_data, language="es")
+            texto = result["text"]
 
-        # Crear un buffer en memoria para los datos de audio
-        audio_buffer = io.BytesIO()
+            if texto.strip():
+                translator = Translator()
+                self.message_queue.put("Traduciendo texto...")
+                translated_text = translator.translate(texto, src='es', dest='es')
 
-        # Escribir un archivo WAV en el buffer en memoria
-        with wave.open(audio_buffer, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)  # 2 bytes = 16 bits
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(byte_data)
+                self.message_queue.put(f"Texto original: {texto}")
+                self.message_queue.put(f"Texto traducido: {translated_text.text}")
 
-        # Mover el puntero al inicio del buffer
-        audio_buffer.seek(0)
-
-        # Usar el buffer directamente para el reconocimiento de voz
-        r = sr.Recognizer()
-        with sr.AudioFile(audio_buffer) as source:
-            self.update.emit("Reconociendo voz...", "")
-            audio_data = r.record(source)
-
-            try:
-                # Reconocimiento de voz en portugués brasileño
-                # texto = r.recognize_google(audio_data, language='pt-BR')
-                texto = r.recognize_google(audio_data, language='es-ES')
-                if texto.strip():
-                    translator = Translator()
-                    # translated_text = translator.translate(texto, src='pt', dest='es')  # Traducir de portugués a español
-                    translated_text = translator.translate(texto, src='es', dest='es')  # Traducir de portugués a español
-                    self.update.emit(texto, translated_text.text)
-            except Exception as e:
-                self.update.emit(str(e), "")
-
+        except Exception as e:
+            self.message_queue.put(f"Error: {str(e)}")
 
     def stop(self):
         self.is_recording = False
+
 
 class AudioTranslatorApp(QWidget):
     def __init__(self):
         super().__init__()
         self.initUI()
         self.is_recording = False
+        self.message_queue = queue.Queue()  # Crear la cola de mensajes
+
+        # Usar un temporizador para verificar la cola
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.check_messages)
+        self.timer.start(100)  # Verificar la cola cada 100 ms
 
     def initUI(self):
         layout = QVBoxLayout()
@@ -146,9 +136,7 @@ class AudioTranslatorApp(QWidget):
         self.resultText.append("Grabando...")
 
         selected_speaker = self.speakers[self.deviceCombo.currentIndex()]
-        self.thread = AudioRecorderThread(selected_speaker)
-        self.thread.update.connect(self.onUpdate)
-        self.thread.finished.connect(self.onRecordingFinished)
+        self.thread = AudioRecorderThread(selected_speaker, self.message_queue)
         self.thread.start()
 
     def stopRecording(self):
@@ -157,12 +145,11 @@ class AudioTranslatorApp(QWidget):
         self.recordButton.setEnabled(False)
         self.resultText.append("Finalizando grabación...")
 
-    def onUpdate(self, original, translated):
-        self.resultText.append("------------------------")
-        self.resultText.append(f"Texto original: {original}")
-        self.resultText.append("--------")
-        self.resultText.append(f"Texto traducido: {translated}")
-        self.resultText.append("------------------------")
+    def check_messages(self):
+        # Verificar si hay mensajes en la cola y mostrarlos en la interfaz
+        while not self.message_queue.empty():
+            message = self.message_queue.get()
+            self.resultText.append(message)
 
     def onRecordingFinished(self):
         self.is_recording = False
